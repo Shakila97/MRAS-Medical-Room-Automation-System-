@@ -1,65 +1,69 @@
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlmodel import SQLModel
+from mongomock_motor import AsyncMongoMockClient
+from beanie import init_beanie
 
 from src.main import app
-from src.core.database import get_db
+from src.core.config import settings
 from src.modules.user import User, UserRole
 from src.core.security import hash_password
-
-# ── In-memory SQLite for tests (no real DB needed) ────────────────────────────
-TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
-
-test_engine = create_async_engine(
-    TEST_DATABASE_URL,
-    connect_args={"check_same_thread": False},
+from src.models import (
+    Patient, Vital, Consultation, Drug, Prescription, PrescriptionLine,
+    InventoryItem, GRN, GRNLot, JRISSIRecord, Appointment,
+    Notification, ForecastSignal, AuditLog
 )
 
-TestSessionLocal = async_sessionmaker(
-    bind=test_engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
+TEST_DATABASE_URL = "mongodb://localhost:27017/mras_test_db"
 
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def init_beanie_for_tests():
+    """Initialize Beanie with a mock MongoDB client for the test session."""
+    settings.DATABASE_URL = TEST_DATABASE_URL
+    mock_client = AsyncMongoMockClient()
+    
+    # We patch the database initialization to use our mock client
+    from src.core import database
+    # Overwrite the actual init_db so the app lifespan uses the mock
+    async def mock_init_db():
+        await init_beanie(
+            database=mock_client.get_database("mras_test_db"),
+            document_models=[
+                User, Patient, Vital, Consultation, Drug, Prescription,
+                PrescriptionLine, InventoryItem, GRN, GRNLot,
+                JRISSIRecord, Appointment, Notification,
+                ForecastSignal, AuditLog
+            ]
+        )
+    database.init_db = mock_init_db
+    
+    # Also initialize it right now for tests
+    await mock_init_db()
+    
+    yield mock_client
 
 @pytest_asyncio.fixture(scope="function", autouse=True)
-async def setup_test_db():
-    """Create fresh tables before each test, drop after."""
-    async with test_engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
+async def setup_test_db(init_beanie_for_tests):
+    """Clear collections before each test."""
+    mock_client = init_beanie_for_tests
+    db = mock_client.get_database("mras_test_db")
+    
+    # Drop collections to start fresh
+    for collection_name in await db.list_collection_names():
+        await db.drop_collection(collection_name)
     yield
-    async with test_engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.drop_all)
-
 
 @pytest_asyncio.fixture
-async def db() -> AsyncSession:
-    """Yield a test database session."""
-    async with TestSessionLocal() as session:
-        yield session
-
-
-@pytest_asyncio.fixture
-async def client(db: AsyncSession) -> AsyncClient:
-    """Yield an async HTTP test client wired to the test DB."""
-    async def override_get_db():
-        yield db
-
-    app.dependency_overrides[get_db] = override_get_db
-
+async def client() -> AsyncClient:
+    """Yield an async HTTP test client."""
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
     ) as ac:
         yield ac
 
-    app.dependency_overrides.clear()
-
-
 @pytest_asyncio.fixture
-async def sample_employee(db: AsyncSession) -> User:
+async def sample_employee() -> User:
     """A pre-created employee user for use in tests."""
     user = User(
         email="employee@test.mras",
@@ -69,14 +73,11 @@ async def sample_employee(db: AsyncSession) -> User:
         role=UserRole.EMPLOYEE,
         is_active=True,
     )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
+    await user.insert()
     return user
 
-
 @pytest_asyncio.fixture
-async def sample_doctor(db: AsyncSession) -> User:
+async def sample_doctor() -> User:
     """A pre-created doctor user for use in tests."""
     user = User(
         email="doctor@test.mras",
@@ -85,11 +86,21 @@ async def sample_doctor(db: AsyncSession) -> User:
         role=UserRole.DOCTOR,
         is_active=True,
     )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
+    await user.insert()
     return user
 
+@pytest_asyncio.fixture
+async def sample_admin() -> User:
+    """A pre-created admin user for use in tests."""
+    user = User(
+        email="admin@test.mras",
+        full_name="System Admin",
+        hashed_password=hash_password("password123"),
+        role=UserRole.ADMIN,
+        is_active=True,
+    )
+    await user.insert()
+    return user
 
 @pytest_asyncio.fixture
 async def employee_token(client: AsyncClient, sample_employee: User) -> str:
@@ -100,12 +111,20 @@ async def employee_token(client: AsyncClient, sample_employee: User) -> str:
     })
     return resp.json()["access_token"]
 
-
 @pytest_asyncio.fixture
 async def doctor_token(client: AsyncClient, sample_doctor: User) -> str:
     """Login as doctor and return the access token."""
     resp = await client.post("/api/auth/login", json={
         "email": "doctor@test.mras",
+        "password": "password123",
+    })
+    return resp.json()["access_token"]
+
+@pytest_asyncio.fixture
+async def admin_token(client: AsyncClient, sample_admin: User) -> str:
+    """Login as admin and return the access token."""
+    resp = await client.post("/api/auth/login", json={
+        "email": "admin@test.mras",
         "password": "password123",
     })
     return resp.json()["access_token"]

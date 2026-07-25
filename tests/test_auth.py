@@ -95,11 +95,10 @@ class TestLogin:
         assert resp.status_code == 401
 
     async def test_login_inactive_user(
-        self, client: AsyncClient, sample_employee: User, db
+        self, client: AsyncClient, sample_employee: User
     ):
         sample_employee.is_active = False
-        db.add(sample_employee)
-        await db.commit()
+        await sample_employee.save()
 
         resp = await client.post("/api/auth/login", json={
             "email": "employee@test.mras",
